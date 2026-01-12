@@ -1,0 +1,32 @@
+{
+  "nav": {
+    "pricing": "Tarifs",
+    "login": "Connexion",
+    "openApp": "Ouvrir l’app"
+  },
+  "home": {
+    "title": "ShortCraft",
+    "tagline": "D’une idée à des scripts short prêts à tourner en quelques minutes.",
+    "v1Title": "Sortie V1",
+    "v1Line1": "Idée → Hooks → Storyboard → Prompts image → Prompts vidéo → Script prêt à enregistrer.",
+    "v1Line2": "Aucun rendu média. Texte + prompts seulement."
+  },
+  "login": {
+    "title": "Connexion",
+    "subtitle": "Connecte-toi avec Google.",
+    "google": "Continuer avec Google"
+  },
+  "pricing": {
+    "title": "Tarifs",
+    "subtitle": "Tarification simple pour créateurs et agences.",
+    "back": "Retour",
+    "free": {
+      "title": "Gratuit",
+      "desc": "Teste le workflow et génère quelques sorties."
+    },
+    "pro": {
+      "title": "Pro",
+      "desc": "Générations illimitées, projets sauvegardés, exports prêts équipe."
+    }
+  }
+}

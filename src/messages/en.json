@@ -1,0 +1,32 @@
+{
+  "nav": {
+    "pricing": "Pricing",
+    "login": "Login",
+    "openApp": "Open App"
+  },
+  "home": {
+    "title": "ShortCraft",
+    "tagline": "From one idea to short-ready video scripts in minutes.",
+    "v1Title": "V1 Output",
+    "v1Line1": "Idea → Hooks → Storyboard → Image prompts → Video prompts → Ready-to-record script.",
+    "v1Line2": "No media rendering. Text + prompts only."
+  },
+  "login": {
+    "title": "Login",
+    "subtitle": "Sign in with Google.",
+    "google": "Continue with Google"
+  },
+  "pricing": {
+    "title": "Pricing",
+    "subtitle": "Simple pricing for creators and agencies.",
+    "back": "Back",
+    "free": {
+      "title": "Free",
+      "desc": "Try the workflow and generate a few outputs."
+    },
+    "pro": {
+      "title": "Pro",
+      "desc": "Unlimited generations, saved projects, and team-ready exports."
+    }
+  }
+}
