@@ -17,10 +17,14 @@ export default async function NewProjectPage({
     where: { email },
     select: { id: true },
   });
+
   if (!user) redirect(`/${locale}/login?callbackUrl=/${locale}/app/projects/new`);
 
+  // ✅ IMPORTANT: on fige l'id non-null pour l'utiliser partout (y compris dans la server action)
+  const currentUserId = user.id;
+
   const clients = await prisma.client.findMany({
-    where: { userId: user.id },
+    where: { userId: currentUserId },
     orderBy: { createdAt: "desc" },
     select: { id: true, name: true },
   });
@@ -34,13 +38,12 @@ export default async function NewProjectPage({
     const clientId = clientIdRaw.length ? clientIdRaw : null;
 
     if (!title || !idea) {
-      // Minimal safety: just redirect back (no crash)
       redirect(`/${locale}/app/projects/new`);
     }
 
     const project = await prisma.project.create({
       data: {
-        userId: user.id,
+        userId: currentUserId, // ✅ FIX: plus de user.id ici
         clientId,
         title,
         idea,
@@ -107,17 +110,11 @@ export default async function NewProjectPage({
         </div>
 
         <div className="flex items-center justify-between gap-3">
-          <a
-            className="rounded-xl border px-4 py-2"
-            href={`/${locale}/app/projects`}
-          >
+          <a className="rounded-xl border px-4 py-2" href={`/${locale}/app/projects`}>
             Cancel
           </a>
 
-          <button
-            type="submit"
-            className="rounded-xl border px-4 py-2"
-          >
+          <button type="submit" className="rounded-xl border px-4 py-2">
             Create project
           </button>
         </div>

@@ -300,12 +300,25 @@ export default async function ProjectDetailsPage({
       ) : null}
 
       {/* Video prompts */}
-      {videoPromptsOutput?.content ? (
-        <section className="mt-6">
-          <h2 className="text-lg font-semibold">Video prompts</h2>
-          <VideoPromptsPanel content={videoPromptsOutput.content} />
-        </section>
-      ) : null}
+{videoPromptsOutput?.content ? (
+  <section className="mt-6">
+    <div className="flex items-center justify-between">
+      <h2 className="text-lg font-semibold">Video prompts</h2>
+      <span className="text-xs text-neutral-500">{videoPromptsVersionLabel}</span>
+    </div>
+
+    <VideoPromptsPanel content={videoPromptsOutput.content as any} />
+  </section>
+) : (
+  <section className="mt-6 rounded-2xl border p-6">
+    <h2 className="text-lg font-semibold">Video prompts</h2>
+    <p className="mt-2 text-sm text-neutral-600">Video prompts not generated yet.</p>
+    <p className="mt-1 text-sm text-neutral-500">
+      Generate image prompts first, then generate video prompts.
+    </p>
+  </section>
+)}
+
 
       {/* Editing script */}
       <EditingScriptSection
