@@ -20,7 +20,7 @@ export default async function NewProjectPage({
 
   if (!user) redirect(`/${locale}/login?callbackUrl=/${locale}/app/projects/new`);
 
-  // ✅ IMPORTANT: on fige l'id non-null pour l'utiliser partout (y compris dans la server action)
+  // ✅ IMPORTANT: id figé pour la server action
   const currentUserId = user.id;
 
   const clients = await prisma.client.findMany({
@@ -37,17 +37,22 @@ export default async function NewProjectPage({
     const clientIdRaw = String(formData.get("clientId") ?? "").trim();
     const clientId = clientIdRaw.length ? clientIdRaw : null;
 
+    // 🟢 NEW: content language
+    const contentLanguage =
+      String(formData.get("contentLanguage") ?? "en") === "fr" ? "fr" : "en";
+
     if (!title || !idea) {
       redirect(`/${locale}/app/projects/new`);
     }
 
     const project = await prisma.project.create({
       data: {
-        userId: currentUserId, // ✅ FIX: plus de user.id ici
+        userId: currentUserId,
         clientId,
         title,
         idea,
         status: "DRAFT",
+        contentLanguage, // ✅ source de vérité du contenu
       },
       select: { id: true },
     });
@@ -66,7 +71,8 @@ export default async function NewProjectPage({
       </div>
 
       <form action={createProject} className="mt-8 space-y-5">
-        <div className="rounded-2xl border p-6 space-y-4">
+        <div className="rounded-2xl border p-6 space-y-5">
+          {/* Title */}
           <div>
             <label className="block text-sm font-medium">Title</label>
             <input
@@ -78,6 +84,7 @@ export default async function NewProjectPage({
             />
           </div>
 
+          {/* Idea */}
           <div>
             <label className="block text-sm font-medium">Idea</label>
             <textarea
@@ -88,6 +95,28 @@ export default async function NewProjectPage({
             />
           </div>
 
+          {/* Content language */}
+          <div>
+            <label className="block text-sm font-medium">
+              Content language
+            </label>
+            <select
+              name="contentLanguage"
+              className="mt-2 w-full rounded-xl border px-4 py-3"
+              defaultValue="en"
+            >
+              <option value="en">🇺🇸 English</option>
+              <option value="fr">🇫🇷 Français</option>
+            </select>
+
+            <p className="mt-2 text-xs text-neutral-500">
+              This language is used for hooks, storyboard, and scripts.
+              <br />
+              Image & video prompts are always generated in English.
+            </p>
+          </div>
+
+          {/* Client */}
           <div>
             <label className="block text-sm font-medium">Client (optional)</label>
             <select
@@ -110,7 +139,10 @@ export default async function NewProjectPage({
         </div>
 
         <div className="flex items-center justify-between gap-3">
-          <a className="rounded-xl border px-4 py-2" href={`/${locale}/app/projects`}>
+          <a
+            className="rounded-xl border px-4 py-2"
+            href={`/${locale}/app/projects`}
+          >
             Cancel
           </a>
 
