@@ -54,10 +54,13 @@ function getPromptsArray(content: VideoPromptsContent): VideoPromptItem[] {
 /** Try to infer a tool preset from DB content */
 function inferToolPreset(content: VideoPromptsContent): string | null {
   if (!content) return null;
-  const obj = !Array.isArray(content) && typeof content === "object" ? content : null;
+  const obj =
+    !Array.isArray(content) && typeof content === "object" ? content : null;
   const meta = obj?.meta ?? null;
 
-  const candidates = [meta?.toolPreset, meta?.tool, obj?.toolPreset, obj?.tool].filter(Boolean);
+  const candidates = [meta?.toolPreset, meta?.tool, obj?.toolPreset, obj?.tool].filter(
+    Boolean
+  );
 
   if (candidates.length) {
     const v = String(candidates[0]).toUpperCase();
@@ -91,7 +94,13 @@ function resolvePromptText(item: VideoPromptItem, variant: VariantKey): string {
     if (typeof direct === "string" && direct.trim()) return direct;
 
     // common shapes like { generic, veo, runway }
-    const alt = full?.generic || full?.veo || full?.runway || full?.text || full?.fullPrompt || null;
+    const alt =
+      full?.generic ||
+      full?.veo ||
+      full?.runway ||
+      full?.text ||
+      full?.fullPrompt ||
+      null;
     if (typeof alt === "string" && alt.trim()) return alt;
 
     // fallback stringification
@@ -104,7 +113,9 @@ function resolvePromptText(item: VideoPromptItem, variant: VariantKey): string {
   return "";
 }
 
-function toolDefaultsFromPreset(toolPreset: string | null): { variant: VariantKey; format: CopyFormatKey } | null {
+function toolDefaultsFromPreset(
+  toolPreset: string | null
+): { variant: VariantKey; format: CopyFormatKey } | null {
   if (!toolPreset) return null;
   const t = toolPreset.toUpperCase();
   if (t === "VEO") return { variant: "VEO", format: "VEO31_READY" };
@@ -171,7 +182,12 @@ async function copyToClipboard(text: string) {
 /** When user changes Variant, auto-pick a matching Copy Format (without overriding explicit tool formats like JSON/Pika/etc.) */
 function syncFormatOnVariantChange(nextVariant: VariantKey, prevFormat: CopyFormatKey): CopyFormatKey {
   // If user explicitly chose a “manual” tool format, we respect it.
-  if (prevFormat === "JSON" || prevFormat === "PIKA" || prevFormat === "HEYGEN" || prevFormat === "CAPCUT") {
+  if (
+    prevFormat === "JSON" ||
+    prevFormat === "PIKA" ||
+    prevFormat === "HEYGEN" ||
+    prevFormat === "CAPCUT"
+  ) {
     return prevFormat;
   }
 
@@ -192,32 +208,26 @@ export default function VideoPromptsPanel({
   const LS_VARIANT = "shortcraft.video.variant";
   const LS_FORMAT = "shortcraft.video.copyFormat";
 
-  // Defaults: DB meta.toolPreset -> localStorage -> fallback
-  const initialDefaults = useMemo(() => {
-    const fromTool = toolDefaultsFromPreset(inferredToolPreset);
-    if (fromTool) return fromTool;
+  // ✅ Prevent hydration mismatch:
+  // SSR must render stable defaults (GENERIC/RAW), then client loads localStorage after mount.
+  const [mounted, setMounted] = useState(false);
 
-    if (typeof window !== "undefined") {
-      const v = (localStorage.getItem(LS_VARIANT) || "").toUpperCase();
-      const f = (localStorage.getItem(LS_FORMAT) || "").toUpperCase();
-      const vv = (["GENERIC", "VEO", "RUNWAY"] as const).includes(v as any) ? (v as VariantKey) : null;
-      const ff = (["RAW", "JSON", "VEO31_READY", "RUNWAY_GEN3", "PIKA", "HEYGEN", "CAPCUT"] as const).includes(f as any)
-        ? (f as CopyFormatKey)
-        : null;
+  // Stable SSR defaults
+  const [variant, setVariant] = useState<VariantKey>("GENERIC");
+  const [copyFormat, setCopyFormat] = useState<CopyFormatKey>("RAW");
 
-      const variant = vv ?? "GENERIC";
-      const format = ff ?? defaultFormatForVariant(variant);
-      return { variant, format };
-    }
+  // Expand / collapse
+  const [openScenes, setOpenScenes] = useState<Record<number, boolean>>({});
 
-    return { variant: "GENERIC" as VariantKey, format: "RAW" as CopyFormatKey };
-  }, [inferredToolPreset]);
-
-  const [variant, setVariant] = useState<VariantKey>(initialDefaults.variant);
-  const [copyFormat, setCopyFormat] = useState<CopyFormatKey>(initialDefaults.format);
-
-  // Keep variant/format synced when tool preset exists (ex: DB says VEO)
   useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  // ✅ On mount: set from DB tool preset OR localStorage OR fallback
+  useEffect(() => {
+    if (!mounted) return;
+
+    // 1) If DB toolPreset exists, it wins
     const fromTool = toolDefaultsFromPreset(inferredToolPreset);
     if (fromTool) {
       setVariant(fromTool.variant);
@@ -226,25 +236,48 @@ export default function VideoPromptsPanel({
         localStorage.setItem(LS_VARIANT, fromTool.variant);
         localStorage.setItem(LS_FORMAT, fromTool.format);
       } catch {}
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inferredToolPreset]);
 
-  // Persist user changes
+    // 2) Otherwise load from localStorage
+    try {
+      const v = (localStorage.getItem(LS_VARIANT) || "").toUpperCase();
+      const f = (localStorage.getItem(LS_FORMAT) || "").toUpperCase();
+
+      const vv = (["GENERIC", "VEO", "RUNWAY"] as const).includes(v as any)
+        ? (v as VariantKey)
+        : null;
+
+      const ff = (["RAW", "JSON", "VEO31_READY", "RUNWAY_GEN3", "PIKA", "HEYGEN", "CAPCUT"] as const).includes(
+        f as any
+      )
+        ? (f as CopyFormatKey)
+        : null;
+
+      const nextVariant = vv ?? "GENERIC";
+      const nextFormat = ff ?? defaultFormatForVariant(nextVariant);
+
+      setVariant(nextVariant);
+      setCopyFormat(nextFormat);
+    } catch {
+      // ignore
+    }
+  }, [mounted, inferredToolPreset]);
+
+  // Persist user changes (after mount only)
   useEffect(() => {
+    if (!mounted) return;
     try {
       localStorage.setItem(LS_VARIANT, variant);
     } catch {}
-  }, [variant]);
+  }, [mounted, variant]);
 
   useEffect(() => {
+    if (!mounted) return;
     try {
       localStorage.setItem(LS_FORMAT, copyFormat);
     } catch {}
-  }, [copyFormat]);
-
-  // Expand / collapse
-  const [openScenes, setOpenScenes] = useState<Record<number, boolean>>({});
+  }, [mounted, copyFormat]);
 
   function expandAll() {
     const next: Record<number, boolean> = {};
@@ -260,6 +293,10 @@ export default function VideoPromptsPanel({
     if (variant === "RUNWAY") return "RUNWAY";
     return "GENERIC";
   }, [variant]);
+
+  // ✅ Safe label for SSR (prevents mismatch)
+  const safeHeaderToolLabel = mounted ? headerToolLabel : "GENERIC";
+  const safeCopyFormat = mounted ? copyFormat : "RAW";
 
   return (
     <section className="mt-12">
@@ -430,9 +467,9 @@ export default function VideoPromptsPanel({
         </div>
 
         <div className="mt-4 text-xs text-neutral-500">
-          Selected variant: <span className="font-semibold">{headerToolLabel}</span>
+          Selected variant: <span className="font-semibold">{safeHeaderToolLabel}</span>
           {" · "}
-          Selected copy format: <span className="font-semibold">{copyFormat}</span>
+          Selected copy format: <span className="font-semibold">{safeCopyFormat}</span>
           {inferredToolPreset ? (
             <>
               {" · "}

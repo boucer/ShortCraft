@@ -3,461 +3,625 @@ import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { openai } from "@/lib/openai";
 
-type UserPlan = "FREE" | "STARTER" | "PRO" | "STUDIO";
+type UserPlan = "FREE" | "STARTER" | "PRO" | "AGENCY";
+type EditingMode = "STATIC" | "DYNAMIC";
+type ProductionMode = "IMAGE_ONLY" | "BALANCED" | "PREMIUM";
+type MaxVideoScenes = 0 | 2 | 4;
 
-/**
- * V1.1 plan resolution (no DB migration):
- * - Defaults to FREE
- * - You can override by email allowlists in env vars:
- *   SHORTCRAFT_STARTER_EMAILS, SHORTCRAFT_PRO_EMAILS, SHORTCRAFT_STUDIO_EMAILS
- *   (comma-separated emails)
- */
+function parseEmailList(envValue: string | undefined) {
+  return (envValue || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+function isSuperAdmin(email: string) {
+  const list = parseEmailList(process.env.SHORTCRAFT_SUPER_ADMIN_EMAILS);
+  return list.includes((email || "").toLowerCase().trim());
+}
 function resolvePlanByEmail(email: string): UserPlan {
   const e = (email || "").toLowerCase().trim();
-  const list = (v?: string) =>
-    (v || "")
-      .split(",")
-      .map((x) => x.trim().toLowerCase())
-      .filter(Boolean);
-
-  const studio = new Set(list(process.env.SHORTCRAFT_STUDIO_EMAILS));
-  const pro = new Set(list(process.env.SHORTCRAFT_PRO_EMAILS));
-  const starter = new Set(list(process.env.SHORTCRAFT_STARTER_EMAILS));
-
-  if (studio.has(e)) return "STUDIO";
-  if (pro.has(e)) return "PRO";
-  if (starter.has(e)) return "STARTER";
+  const pro = parseEmailList(process.env.SHORTCRAFT_PLAN_PRO_EMAILS);
+  const starter = parseEmailList(process.env.SHORTCRAFT_PLAN_STARTER_EMAILS);
+  const agency = parseEmailList(process.env.SHORTCRAFT_PLAN_AGENCY_EMAILS);
+  if (agency.includes(e)) return "AGENCY";
+  if (pro.includes(e)) return "PRO";
+  if (starter.includes(e)) return "STARTER";
   return "FREE";
 }
-
 function getPlanLimits(plan: UserPlan) {
-  // quota unit = "short output" for generation endpoints (here: editing_script)
-  if (plan === "STUDIO") return { perDay: 50, perWeek: 9999 };
-  if (plan === "PRO") return { perDay: 20, perWeek: 9999 };
-  if (plan === "STARTER") return { perDay: 5, perWeek: 9999 };
-  // FREE: 1/day AND max 3/week
-  return { perDay: 1, perWeek: 3 };
+  if (plan === "AGENCY") return { daily: 999, weeklyMax: 999 };
+  if (plan === "PRO") return { daily: 20, weeklyMax: 100 };
+  if (plan === "STARTER") return { daily: 5, weeklyMax: 25 };
+  return { daily: 1, weeklyMax: 3 };
 }
 
-// ---------- helpers: JSON parsing ----------
-function stripFences(raw: string) {
-  return (raw || "").trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "");
-}
-
-function safeJsonParse(raw: string) {
-  const cleaned = stripFences(raw);
+function ensureString(v: any) {
+  if (typeof v === "string") return v;
+  if (v == null) return "";
   try {
+    return String(v);
+  } catch {
+    return "";
+  }
+}
+
+function stripFences(s: string) {
+  return (s || "")
+    .replace(/^\s*```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+}
+
+/**
+ * ✅ JSON Repair (critical):
+ * - Extract first {...} block
+ * - Remove trailing commas
+ * - Normalize quotes a bit
+ */
+function extractFirstJsonObject(text: string) {
+  const s = stripFences(text || "");
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return s;
+  return s.slice(start, end + 1);
+}
+function removeTrailingCommas(jsonLike: string) {
+  // remove trailing commas before } or ]
+  return jsonLike.replace(/,\s*([}\]])/g, "$1");
+}
+function safeJsonParse(text: string) {
+  try {
+    const extracted = extractFirstJsonObject(text);
+    const cleaned = removeTrailingCommas(extracted);
     return JSON.parse(cleaned);
   } catch {
     return null;
   }
 }
 
-// ---------- timezone helpers (quota windows) ----------
-function tzOffsetMinutes(date: Date, timeZone: string): number {
-  // Intl timeZoneName: 'shortOffset' => e.g. "GMT-05:00"
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    timeZoneName: "shortOffset",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).formatToParts(date);
-
-  const tzName = parts.find((p) => p.type === "timeZoneName")?.value || "GMT+00:00";
-  const m = tzName.match(/GMT([+-])(\d{1,2})(?::?(\d{2}))?/);
-  if (!m) return 0;
-  const sign = m[1] === "-" ? -1 : 1;
-  const hh = Number(m[2] || 0);
-  const mm = Number(m[3] || 0);
-  return sign * (hh * 60 + mm);
+function tzOffsetMinutes() {
+  return -new Date().getTimezoneOffset();
+}
+function startOfDayUTC(localNow: Date) {
+  const d = new Date(localNow);
+  d.setUTCHours(0, 0, 0, 0);
+  return d;
+}
+function startOfWeekUTC(localNow: Date) {
+  const d = new Date(localNow);
+  const dow = d.getUTCDay();
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d;
 }
 
-function startOfDayUTC(timeZone: string) {
-  // 00:00 in the provided IANA timezone, returned as a UTC Date.
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(now);
+function getStoryboardScenesFromContent(content: any) {
+  const arr =
+    (Array.isArray(content?.scenes) && content.scenes) ||
+    (Array.isArray(content?.storyboard?.scenes) && content.storyboard.scenes) ||
+    (Array.isArray(content) && content) ||
+    null;
+  if (!Array.isArray(arr)) return null;
 
-  const y = Number(parts.find((p) => p.type === "year")?.value || 1970);
-  const mo = Number(parts.find((p) => p.type === "month")?.value || 1);
-  const d = Number(parts.find((p) => p.type === "day")?.value || 1);
-
-  // Start from UTC midnight, then subtract tz offset at that moment in the target timezone.
-  const utcMidnight = new Date(Date.UTC(y, mo - 1, d, 0, 0, 0, 0));
-  const offsetMin = tzOffsetMinutes(utcMidnight, timeZone);
-  return new Date(utcMidnight.getTime() - offsetMin * 60_000);
+  return arr
+    .map((s: any, i: number) => ({
+      scene: Number(s?.scene ?? i + 1),
+      visual: ensureString(s?.visual),
+      onScreenText: ensureString(s?.onScreenText),
+      voiceover: ensureString(s?.voiceover),
+    }))
+    .filter((x: any) => x.voiceover || x.visual || x.onScreenText);
 }
 
-function startOfWeekUTC(timeZone: string) {
-  // ISO week starts Monday in the target timezone.
-  const dayStart = startOfDayUTC(timeZone);
+function getVideoPromptsArrayFromContent(content: any) {
+  const arr =
+    (Array.isArray(content?.prompts) && content.prompts) ||
+    (Array.isArray(content?.videoPrompts) && content.videoPrompts) ||
+    (Array.isArray(content) && content) ||
+    null;
+  if (!Array.isArray(arr)) return null;
 
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    weekday: "short",
-  }).formatToParts(dayStart);
-
-  const wdStr = (parts.find((p) => p.type === "weekday")?.value || "").toLowerCase();
-  const map: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
-  const iso = map[wdStr.slice(0, 3)] || 1;
-
-  const res = new Date(dayStart);
-  res.setUTCDate(res.getUTCDate() - (iso - 1));
-  return res;
+  return arr
+    .map((p: any, i: number) => ({
+      scene: Number(p?.scene ?? i + 1),
+      prompt: ensureString(p?.prompt || p?.visualPrompt || p?.scenePrompt),
+      camera: ensureString(p?.camera),
+      notes: ensureString(p?.notes),
+    }))
+    .filter((x: any) => x.prompt || x.camera || x.notes);
 }
 
-type StoryboardScene = {
-  scene: number;
-  onScreenText: string;
-  voiceover: string;
-  visual: string;
-};
-
-function getStoryboardScenesFromContent(content: any): StoryboardScene[] | null {
-  if (!content) return null;
-  if (Array.isArray(content)) return content as StoryboardScene[];
-  if (content && Array.isArray((content as any).scenes)) return (content as any).scenes as StoryboardScene[];
-  return null;
+function fmt1(n: number) {
+  return Math.round(n * 10) / 10;
+}
+function makeTimeRanges(count: number, totalSec: number) {
+  const safeCount = Math.max(1, count);
+  const dur = Math.max(1, totalSec);
+  const step = dur / safeCount;
+  const out: string[] = [];
+  for (let i = 0; i < safeCount; i++) {
+    const a = fmt1(i * step);
+    const b = fmt1((i + 1) * step);
+    out.push(`${a}–${b}s`);
+  }
+  return out;
+}
+function normalizeEditingScriptTimes(payload: any, count: number, totalSec: number) {
+  const times = makeTimeRanges(count, totalSec);
+  const tl = Array.isArray(payload?.timeline) ? payload.timeline : [];
+  const next = tl.map((it: any, idx: number) => ({
+    ...it,
+    time: times[idx] || it?.time || "",
+  }));
+  return { ...payload, timeline: next };
 }
 
-function getVideoPromptsArrayFromContent(content: any): any[] | null {
-  if (!content) return null;
-  if (Array.isArray(content)) return content;
-  const c = content as any;
-  if (Array.isArray(c.prompts)) return c.prompts;
-  if (Array.isArray(c.scenes)) return c.scenes;
-  return null;
+function ensureTimelineMatchesStoryboard(timeline: any[], storyboard: any[]) {
+  const sbLen = storyboard.length;
+  const tl = Array.isArray(timeline) ? timeline : [];
+  const next: any[] = [];
+  for (let i = 0; i < sbLen; i++) {
+    const item = tl[i] || {};
+    next.push({
+      ...item,
+      scene: i + 1,
+      voiceover: ensureString(item?.voiceover || storyboard[i]?.voiceover),
+      onScreenText: ensureString(item?.onScreenText || storyboard[i]?.onScreenText),
+      clip: ensureString(item?.clip),
+      edit: ensureString(item?.edit),
+      sound: ensureString(item?.sound),
+      notes: ensureString(item?.notes),
+      // keep any assetType, but normalize later
+      assetType: ensureString(item?.assetType),
+      sourceScenes: item?.sourceScenes,
+    });
+  }
+  return next;
 }
 
-function ensureString(v: any): string {
-  if (!v) return "";
-  if (typeof v === "string") return v;
-  if (typeof v === "object") return JSON.stringify(v, null, 2);
-  return String(v);
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+function hashToUnitFloat(seed: string) {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const u = h >>> 0;
+  return u / 4294967295;
+}
+
+function buildDynamicPlan(storyboardLen: number, seed: string) {
+  const minScenes = Math.min(6, storyboardLen);
+  const maxScenes = Math.min(9, storyboardLen);
+
+  const r1 = hashToUnitFloat(seed + "|scenes");
+  const sceneCount = clamp(
+    Math.round(minScenes + r1 * (maxScenes - minScenes)),
+    minScenes,
+    maxScenes
+  );
+
+  const r2 = hashToUnitFloat(seed + "|dur");
+  const rawDur = 21 + r2 * 4;
+  const targetDuration = Math.round(rawDur * 2) / 2;
+
+  const groups: number[][] = [];
+  const mergesNeeded = storyboardLen - sceneCount;
+  const base: number[][] = [];
+  for (let i = 1; i <= storyboardLen; i++) base.push([i]);
+
+  const mergeIndexes: number[] = [];
+  for (let k = 0; k < mergesNeeded; k++) {
+    const r = hashToUnitFloat(seed + "|merge|" + k);
+    mergeIndexes.push(Math.floor(r * Math.max(1, base.length - 1)));
+  }
+
+  mergeIndexes
+    .sort((a, b) => a - b)
+    .reverse()
+    .forEach((idx) => {
+      const i = clamp(idx, 0, base.length - 2);
+      const merged = [...base[i], ...base[i + 1]];
+      base.splice(i, 2, merged);
+    });
+
+  for (const g of base) groups.push(g);
+  return { sceneCount, targetDuration, groups };
 }
 
 /**
- * Locale-first output fetch:
- * 1) Try current locale (latest version)
- * 2) Fallback any locale (latest version)
+ * ✅ Smart picks by timeline index (hook/payoff/anchors)
+ * Deterministic and perfect for V1.
  */
-async function findLatestOutputLocaleFirst(projectId: string, locale: string, kind: string, select: any) {
-  // 1) Locale-first
-  const local = await prisma.projectOutput.findFirst({
-    where: { projectId, locale, kind },
-    orderBy: { version: "desc" },
-    select,
-  });
-  if (local) return local;
+function pickVideoSceneIndexes(timelineLen: number, maxVideoScenes: MaxVideoScenes): number[] {
+  if (maxVideoScenes === 0) return [];
+  if (timelineLen <= 1) return maxVideoScenes > 0 ? [0] : [];
 
-  // 2) Fallback any locale (latest version)
-  return prisma.projectOutput.findFirst({
+  const idxs: number[] = [];
+  idxs.push(0); // hook
+  if (maxVideoScenes >= 2) idxs.push(timelineLen - 1); // payoff
+  if (maxVideoScenes >= 4) {
+    const a = Math.floor(timelineLen * 0.33);
+    const b = Math.floor(timelineLen * 0.66);
+    if (!idxs.includes(a)) idxs.push(a);
+    if (!idxs.includes(b)) idxs.push(b);
+  }
+  return Array.from(new Set(idxs)).sort((x, y) => x - y).slice(0, maxVideoScenes);
+}
+
+function normalizeAssetType(v: any) {
+  const s = ensureString(v).trim().toUpperCase();
+  if (s === "VIDEO") return "VIDEO";
+  return "IMAGE";
+}
+
+/**
+ * ✅ HARD enforce:
+ * - compute SMART picks from maxVideoScenes
+ * - force those indexes to VIDEO (unless IMAGE_ONLY)
+ * - force all others to IMAGE if we exceed max
+ * Also returns smartVideoIndexes used.
+ */
+function enforceSmartVideoPicks(
+  timeline: any[],
+  productionMode: ProductionMode,
+  maxVideoScenes: MaxVideoScenes
+) {
+  const tl = Array.isArray(timeline) ? timeline : [];
+  const normalized = tl.map((it) => ({
+    ...it,
+    assetType: normalizeAssetType(it?.assetType),
+  }));
+
+  if (productionMode === "IMAGE_ONLY" || maxVideoScenes === 0) {
+    return {
+      timeline: normalized.map((it) => ({ ...it, assetType: "IMAGE" })),
+      smartVideoIndexes: [] as number[],
+    };
+  }
+
+  const picks = pickVideoSceneIndexes(normalized.length, maxVideoScenes);
+  const set = new Set(picks);
+
+  const forced = normalized.map((it, idx) => ({
+    ...it,
+    assetType: set.has(idx) ? "VIDEO" : "IMAGE",
+  }));
+
+  return { timeline: forced, smartVideoIndexes: picks };
+}
+
+async function findLatestOutputLocaleFirst(projectId: string, kind: string, locale: string) {
+  const exact = await prisma.projectOutput.findFirst({
+    where: { projectId, kind, locale },
+    orderBy: { version: "desc" },
+  });
+  if (exact) return exact;
+
+  return await prisma.projectOutput.findFirst({
     where: { projectId, kind },
-    orderBy: { version: "desc" },
-    select,
+    orderBy: [{ locale: "desc" }, { version: "desc" }],
   });
 }
 
-// ---------- helpers: OpenAI call (supports both APIs) ----------
 async function callModel(system: string, user: string) {
-  const anyOpenai = openai as any;
-
-  // Responses API (preferred)
-  if (anyOpenai?.responses?.create) {
-    return await anyOpenai.responses.create({
-      model: process.env.OPENAI_MODEL_EDITING_SCRIPT || process.env.OPENAI_MODEL || "gpt-4o-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.4,
-    });
-  }
-
-  // Chat Completions API fallback
-  if (anyOpenai?.chat?.completions?.create) {
-    return await anyOpenai.chat.completions.create({
-      model: process.env.OPENAI_MODEL_EDITING_SCRIPT || process.env.OPENAI_MODEL || "gpt-4o-mini",
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      temperature: 0.4,
-    });
-  }
-
-  throw new Error("OpenAI client not configured (responses.create or chat.completions.create missing).");
+  return await openai.responses.create({
+    model: process.env.OPENAI_MODEL_EDITING_SCRIPT || "gpt-4.1-mini",
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  });
 }
 
-function extractText(resp: any): string {
-  // Responses API shape
-  if (resp?.output_text && typeof resp.output_text === "string") return resp.output_text;
+function extractText(res: any) {
+  const outText = (res as any)?.output_text;
+  if (typeof outText === "string" && outText.trim()) return outText;
 
-  // Some SDKs put text in output array
-  if (Array.isArray(resp?.output)) {
-    const texts: string[] = [];
-    for (const item of resp.output) {
-      if (item?.type === "message" && Array.isArray(item?.content)) {
-        for (const c of item.content) {
-          if (c?.type === "output_text" && typeof c.text === "string") texts.push(c.text);
-          if (c?.type === "text" && typeof c.text === "string") texts.push(c.text);
+  const output = (res as any)?.output;
+  if (Array.isArray(output)) {
+    for (const item of output) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c?.type === "output_text" && typeof c?.text === "string") return c.text;
+          if (c?.type === "text" && typeof c?.text === "string") return c.text;
         }
       }
     }
-    if (texts.length) return texts.join("\n");
   }
-
-  // Chat Completions shape
-  const cc = resp?.choices?.[0]?.message?.content;
-  if (typeof cc === "string" && cc.trim()) return cc.trim();
-
   return "";
 }
 
-// ---------- route ----------
 export async function POST(req: Request) {
-  const session = await auth();
-  if (!session?.user?.email) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const body = await req.json().catch(() => ({}));
-  const projectId = String(body?.projectId || "").trim();
-  const locale = String(body?.locale || "").trim() || "en";
-
-  if (!projectId) {
-    return NextResponse.json({ error: "Missing projectId" }, { status: 400 });
-  }
-
-  const user = await prisma.user.findUnique({
-    where: { email: session.user.email },
-    select: { id: true },
-  });
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
-  const project = await prisma.project.findFirst({
-    where: { id: projectId, userId: user.id },
-    select: { id: true, title: true },
-  });
-  if (!project) return NextResponse.json({ error: "Not found" }, { status: 404 });
-
-  // ---------- quota (V1.1) ----------
-  const plan = resolvePlanByEmail(session.user.email);
-  const limits = getPlanLimits(plan);
-
-  // Count usage for this user across ALL projects for the quota windows.
-  // We count ONLY the heavy "short output" generations (editing_script and final script).
-  const countKinds = ["editing_script", "script"];
-
-  const tz = "America/Montreal";
-  const dayStart = startOfDayUTC(tz);
-  const weekStart = startOfWeekUTC(tz);
-
-  const userProjectIds = await prisma.project.findMany({
-    where: { userId: user.id },
-    select: { id: true },
-  });
-  const pid = userProjectIds.map((p) => p.id);
-
-  const usedToday = await prisma.projectOutput.count({
-    where: {
-      projectId: { in: pid },
-      kind: { in: countKinds },
-      createdAt: { gte: dayStart },
-    },
-  });
-
-  const usedThisWeek = await prisma.projectOutput.count({
-    where: {
-      projectId: { in: pid },
-      kind: { in: countKinds },
-      createdAt: { gte: weekStart },
-    },
-  });
-
-  if (usedToday >= limits.perDay || usedThisWeek >= limits.perWeek) {
-    const remainingToday = Math.max(0, limits.perDay - usedToday);
-    const remainingWeek = Math.max(0, limits.perWeek - usedThisWeek);
-    return NextResponse.json(
-      {
-        error: "Quota exceeded",
-        code: "QUOTA_EXCEEDED",
-        plan,
-        limits,
-        usage: { today: usedToday, week: usedThisWeek },
-        remaining: { today: remainingToday, week: remainingWeek },
-        message:
-          plan === "FREE"
-            ? "Quota Free atteint. Limite: 1 génération/jour et max 3/semaine."
-            : "Quota atteint pour votre forfait. Réessayez plus tard ou upgrade.",
-      },
-      { status: 429 }
-    );
-  }
-
-  // Load prereqs (locale-first + fallback)
-  const storyboardOutput = await findLatestOutputLocaleFirst(project.id, locale, "storyboard", {
-    content: true,
-    version: true,
-    locale: true,
-  });
-
-  const videoPromptsOutput = await findLatestOutputLocaleFirst(project.id, locale, "video_prompts", {
-    content: true,
-    version: true,
-    locale: true,
-  });
-
-  const storyboardScenes = storyboardOutput
-    ? getStoryboardScenesFromContent((storyboardOutput as any).content)
-    : null;
-
-  const videoPromptsArr = videoPromptsOutput
-    ? getVideoPromptsArrayFromContent((videoPromptsOutput as any).content)
-    : null;
-
-  if (!storyboardScenes || !storyboardScenes.length) {
-    return NextResponse.json(
-      { error: "Missing storyboard. Generate storyboard first." },
-      { status: 400 }
-    );
-  }
-
-  if (!videoPromptsArr || !videoPromptsArr.length) {
-    return NextResponse.json(
-      { error: "Missing video prompts. Generate video prompts first." },
-      { status: 400 }
-    );
-  }
-
-  // Compact inputs to reduce tokens
-  const compactStoryboard = storyboardScenes
-    .slice()
-    .sort((a, b) => (a.scene ?? 0) - (b.scene ?? 0))
-    .map((s) => ({
-      scene: s.scene,
-      visual: s.visual,
-      onScreenText: s.onScreenText,
-      voiceover: s.voiceover,
-    }));
-
-  const compactVideoPrompts = videoPromptsArr
-    .map((p: any) => ({
-      sceneNumber: Number(p?.sceneNumber ?? p?.scene ?? 0),
-      title: typeof p?.title === "string" ? p.title : undefined,
-      prompt: ensureString(p?.fullPrompt ?? p?.prompt ?? p),
-    }))
-    .filter((p: any) => p.sceneNumber > 0 && p.prompt.trim().length > 0)
-    .sort((a: any, b: any) => a.sceneNumber - b.sceneNumber)
-    .slice(0, 12);
-
-  // Next version for editing_script
-  const latest = await prisma.projectOutput.findFirst({
-    where: { projectId: project.id, kind: "editing_script", locale },
-    orderBy: { version: "desc" },
-    select: { version: true },
-  });
-  const nextVersion = (latest?.version || 0) + 1;
-
-  const system = [
-    "You are a senior short-form video editor.",
-    "Your job: produce an EDITING SCRIPT (not a narration script).",
-    "Return STRICT JSON only (no markdown).",
-    "Output must be actionable for CapCut/Premiere: cuts, pacing, text, b-roll, sfx, music cues.",
-    "Assume vertical 9:16, TARGET duration 22–23 seconds (must land in that range).",
-    "Keep voiceover lines aligned with the storyboard voiceover (do not invent new VO).",
-  ].join("\n");
-
-  const userPrompt = [
-    `Project: ${project.title}`,
-    "",
-    "INPUT 1) STORYBOARD (truth source, keep VO aligned):",
-    JSON.stringify(compactStoryboard, null, 2),
-    "",
-    "INPUT 2) VIDEO PROMPTS (for visual references / b-roll ideas):",
-    JSON.stringify(compactVideoPrompts, null, 2),
-    "",
-    "OUTPUT REQUIREMENTS:",
-    "- Return STRICT JSON matching this schema:",
-    JSON.stringify(
-      {
-        meta: {
-          targetDuration: "22–23s",
-          style: "fast-paced, clarity-first",
-          aspect: "9:16",
-        },
-        timeline: [
-          {
-            scene: 1,
-            time: "0.0–1.2s",
-            clip: "What is shown (visual clip description)",
-            edit: "Cut/zoom/speed/ramp instructions",
-            onScreenText: "Exact on-screen text (short)",
-            captions: "caption style note (optional)",
-            voiceover: "what VO line plays here (from storyboard)",
-            sound: "SFX + music cue",
-            notes: "extra editor notes",
-          },
-        ],
-        exportNotes: ["global notes for export, captions, pacing, audio, etc."],
-      },
-      null,
-      2
-    ),
-    "",
-    "Hard rules:",
-    "- Total timeline must end between 22.0s and 23.0s.",
-    "- Use micro-cuts and pattern interrupts every 1–2 seconds.",
-    "- On-screen text must be short, high-contrast, and punchy.",
-    "- Add at least 4 SFX cues and 2 music moments (drop/raise).",
-  ].join("\n");
-
   try {
-    const resp = await callModel(system, userPrompt);
-    const raw = extractText(resp);
+    const session = await auth();
+    const email = session?.user?.email || "";
+    const userId = (session?.user as any)?.id;
 
-    const parsed = safeJsonParse(raw);
-    if (!parsed) {
+    if (!session?.user?.email) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const superAdmin = isSuperAdmin(email);
+    const quotaDisabled = process.env.SHORTCRAFT_DISABLE_QUOTA === "1";
+    const quotaBypass = superAdmin || quotaDisabled;
+
+    const plan = resolvePlanByEmail(email);
+    const limits = getPlanLimits(plan);
+
+    const body = await req.json().catch(() => ({}));
+    const projectId = body?.projectId as string | undefined;
+    const locale = (body?.locale as string | undefined) || "en";
+
+    const mode: EditingMode = body?.mode === "DYNAMIC" ? "DYNAMIC" : "STATIC";
+
+    const rawMax = Number(body?.maxVideoScenes);
+    const maxVideoScenes: MaxVideoScenes = rawMax === 2 ? 2 : rawMax === 4 ? 4 : 0;
+
+    const rawProd = String(body?.productionMode || "").toUpperCase();
+    const productionMode: ProductionMode =
+      rawProd === "BALANCED"
+        ? "BALANCED"
+        : rawProd === "PREMIUM"
+        ? "PREMIUM"
+        : maxVideoScenes === 0
+        ? "IMAGE_ONLY"
+        : maxVideoScenes <= 2
+        ? "BALANCED"
+        : "PREMIUM";
+
+    const videoSceneCost =
+      Number.isFinite(Number(body?.videoSceneCost)) ? Number(body?.videoSceneCost) : 3;
+
+    if (!projectId) {
+      return NextResponse.json({ error: "Missing projectId" }, { status: 400 });
+    }
+
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, userId },
+      select: { id: true, title: true, contentLanguage: true },
+    });
+
+    if (!project) {
+      return NextResponse.json({ error: "Project not found" }, { status: 404 });
+    }
+
+    // ✅ Quota checks
+    if (!quotaBypass && plan === "FREE") {
+      const now = new Date();
+      const offsetMin = tzOffsetMinutes();
+      const localNow = new Date(now.getTime() + offsetMin * 60 * 1000);
+
+      const dayStartLocal = startOfDayUTC(localNow);
+      const weekStartLocal = startOfWeekUTC(localNow);
+
+      const dayStartUTC = new Date(dayStartLocal.getTime() - offsetMin * 60 * 1000);
+      const weekStartUTC = new Date(weekStartLocal.getTime() - offsetMin * 60 * 1000);
+
+      const usedToday = await prisma.projectOutput.count({
+        where: { kind: "editing_script", createdAt: { gte: dayStartUTC }, project: { userId } },
+      });
+
+      const usedThisWeek = await prisma.projectOutput.count({
+        where: { kind: "editing_script", createdAt: { gte: weekStartUTC }, project: { userId } },
+      });
+
+      if (usedToday >= limits.daily || usedThisWeek >= limits.weeklyMax) {
+        return NextResponse.json(
+          {
+            error: "Quota exceeded",
+            code: "QUOTA_EXCEEDED",
+            plan,
+            limits,
+            used: { today: usedToday, week: usedThisWeek },
+          },
+          { status: 429 }
+        );
+      }
+    }
+
+    // ✅ Dependencies
+    const storyboardOutput = await findLatestOutputLocaleFirst(projectId, "storyboard", locale);
+    const videoPromptsOutput = await findLatestOutputLocaleFirst(projectId, "video_prompts", locale);
+
+    const storyboardScenes = getStoryboardScenesFromContent(storyboardOutput?.content);
+    const videoPromptsArray = getVideoPromptsArrayFromContent(videoPromptsOutput?.content);
+
+    if (!storyboardScenes || storyboardScenes.length === 0) {
       return NextResponse.json(
-        {
-          error: "Model returned invalid JSON.",
-          details: raw?.slice(0, 800) || "No content",
-        },
-        { status: 500 }
+        { error: "Missing storyboard. Generate storyboard first." },
+        { status: 400 }
       );
     }
 
-    const saved = await prisma.projectOutput.create({
-      data: {
-        projectId: project.id,
-        locale,
-        kind: "editing_script",
-        content: parsed,
-        version: nextVersion,
+    const safeVideoPromptsArray = Array.isArray(videoPromptsArray) ? videoPromptsArray : [];
+
+    const compactStoryboard = storyboardScenes.map((s, i) => ({
+      scene: s.scene ?? i + 1,
+      visual: ensureString(s.visual),
+      onScreenText: ensureString(s.onScreenText),
+      voiceover: ensureString(s.voiceover),
+    }));
+
+    const compactVideoPrompts = safeVideoPromptsArray.slice(0, 12).map((p: any, i: number) => ({
+      scene: p?.scene ?? i + 1,
+      prompt: ensureString(p?.prompt),
+      camera: ensureString(p?.camera),
+      notes: ensureString(p?.notes),
+    }));
+
+    // Next version
+    const last = await prisma.projectOutput.findFirst({
+      where: { projectId, kind: "editing_script", locale },
+      orderBy: { version: "desc" },
+      select: { version: true },
+    });
+    const nextVersion = (last?.version || 0) + 1;
+
+    // Deterministic dynamic plan
+    const seed = `${projectId}|${nextVersion}|${locale}|${mode}|${maxVideoScenes}|${productionMode}`;
+    const dynPlan = buildDynamicPlan(compactStoryboard.length, seed);
+    const targetDuration = mode === "DYNAMIC" ? dynPlan.targetDuration : 22.5;
+
+    // ✅ Schema hint (no trailing commas!)
+    const schemaHint = {
+      meta: {
+        mode,
+        targetDuration,
+        style: "fast-paced, clarity-first",
+        productionMode,
+        maxVideoScenes,
+        videoSceneCost,
+        ...(mode === "DYNAMIC"
+          ? { sceneCount: dynPlan.sceneCount, groupingPlan: dynPlan.groups }
+          : {}),
+        // tells UI and backend what we intend:
+        videoPlacementStrategy: "SMART",
       },
-      select: {
-        id: true,
-        kind: true,
-        version: true,
-        locale: true,
-        createdAt: true,
+      timeline: [
+        {
+          scene: 1,
+          time: "0.0–3.0s",
+          assetType: "IMAGE",
+          ...(mode === "DYNAMIC" ? { sourceScenes: [1, 2] } : {}),
+          clip: "What to show",
+          edit: "Cuts/motion instructions",
+          onScreenText: "Short text",
+          voiceover: "From storyboard only",
+          sound: "SFX + music cue",
+          notes: "Editor notes",
+        },
+      ],
+      exportNotes: ["global notes"],
+    };
+
+    const system = [
+      "You are a senior short-form video editor.",
+      "Return STRICT JSON only (no markdown, no comments).",
+      "Do NOT include trailing commas in JSON.",
+      "Aspect ratio: 9:16.",
+      "Each timeline item MUST include assetType: IMAGE or VIDEO.",
+      `PRODUCTION: productionMode=${productionMode}, maxVideoScenes=${maxVideoScenes} (<=).`,
+      "Voiceover MUST be based ONLY on storyboard voiceover (do not invent new VO).",
+      mode === "DYNAMIC"
+        ? [
+            "MODE: DYNAMIC.",
+            "Use sceneCount provided. Use groupingPlan.",
+            "Each timeline item MUST include sourceScenes exactly matching the grouping plan entry.",
+          ].join("\n")
+        : [
+            "MODE: STATIC.",
+            "Timeline MUST have exactly one item per storyboard scene.",
+          ].join("\n"),
+    ].join("\n");
+
+    const userPrompt = [
+      `Project: ${project.title}`,
+      "",
+      "STORYBOARD (truth source):",
+      JSON.stringify(compactStoryboard, null, 2),
+      "",
+      "VIDEO PROMPTS (OPTIONAL):",
+      JSON.stringify(compactVideoPrompts, null, 2),
+      "",
+      "OUTPUT SCHEMA EXAMPLE:",
+      JSON.stringify(schemaHint, null, 2),
+      "",
+      "REMINDERS:",
+      "- Return JSON only.",
+      "- No trailing commas.",
+      "- Keep VO aligned to storyboard only.",
+    ].join("\n");
+
+    const response = await callModel(system, userPrompt);
+    const raw = extractText(response);
+    const parsed = safeJsonParse(raw);
+
+    if (!parsed || typeof parsed !== "object") {
+      return NextResponse.json(
+        {
+          error: "Model returned invalid JSON.",
+          details: extractFirstJsonObject(raw || "").slice(0, 2000),
+        },
+        { status: 502 }
+      );
+    }
+
+    let normalized: any = parsed;
+
+    // Normalize timeline structure + times
+    if (mode === "STATIC") {
+      normalized.timeline = ensureTimelineMatchesStoryboard(parsed?.timeline, compactStoryboard);
+      normalized = normalizeEditingScriptTimes(normalized, compactStoryboard.length, targetDuration);
+    } else {
+      const desired = dynPlan.sceneCount;
+      const tl = Array.isArray(parsed?.timeline) ? parsed.timeline : [];
+      let fixed = tl.slice(0, desired);
+      while (fixed.length < desired) {
+        fixed.push({
+          scene: fixed.length + 1,
+          time: "",
+          assetType: "IMAGE",
+          sourceScenes: dynPlan.groups[fixed.length] || [],
+          clip: "",
+          edit: "",
+          onScreenText: "",
+          voiceover: "",
+          sound: "",
+          notes: "",
+        });
+      }
+      normalized.timeline = fixed;
+      normalized = normalizeEditingScriptTimes(normalized, desired, targetDuration);
+    }
+
+    // ✅ SMART PICKS: enforce video placement regardless of model output
+    const enforced = enforceSmartVideoPicks(
+      normalized.timeline,
+      productionMode,
+      maxVideoScenes
+    );
+    normalized.timeline = enforced.timeline;
+
+    const mix = {
+      image: normalized.timeline.filter((x: any) => normalizeAssetType(x?.assetType) !== "VIDEO").length,
+      video: normalized.timeline.filter((x: any) => normalizeAssetType(x?.assetType) === "VIDEO").length,
+    };
+
+    normalized.meta = {
+      ...(normalized.meta || {}),
+      mode,
+      targetDuration,
+      sceneCount: Array.isArray(normalized.timeline) ? normalized.timeline.length : 0,
+      style: normalized?.meta?.style || "fast-paced, clarity-first",
+      productionMode,
+      maxVideoScenes,
+      videoSceneCost,
+      estimatedCost: Math.max(0, mix.video) * videoSceneCost,
+      mix,
+      videoPlacementStrategy: "SMART",
+      smartVideoIndexes: enforced.smartVideoIndexes,
+      ...(mode === "DYNAMIC" ? { groupingPlan: dynPlan.groups } : {}),
+      usedPrereqs: {
+        storyboardLocale: (storyboardOutput as any)?.locale || null,
+        videoPromptsLocale: (videoPromptsOutput as any)?.locale || null,
+      },
+    };
+
+    await prisma.projectOutput.create({
+      data: {
+        projectId,
+        kind: "editing_script",
+        locale,
+        version: nextVersion,
+        content: normalized as any,
       },
     });
 
-    return NextResponse.json({
-      ok: true,
-      output: saved,
-      version: nextVersion,
-      usedPrereqs: {
-        storyboardLocale: (storyboardOutput as any)?.locale,
-        videoPromptsLocale: (videoPromptsOutput as any)?.locale,
-      },
-    });
+    return NextResponse.json({ ok: true, mode, version: nextVersion });
   } catch (err: any) {
     console.error("EDITING SCRIPT ERROR", err);
     return NextResponse.json(
